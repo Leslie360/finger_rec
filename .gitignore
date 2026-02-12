@@ -6,6 +6,10 @@ Result_FINAL/
 Result_SD4_FINAL/
 venv/
 logs/
+logs_v1.0/
+logs_v1.1/
+logs_v1.2/
+logs_v1.3/
 *.pyc
 *.pth
 *.npy

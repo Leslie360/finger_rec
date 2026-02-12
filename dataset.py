@@ -17,10 +17,24 @@ class CropBottom:
         return f"{self.__class__.__name__}(crop_height={self.crop_height})"
 
 def get_dataloaders(root_dir='Dataset5'):
-    # 修复：加入了 Resize，且 Normalize 适配 3 通道
-    transform = transforms.Compose([
+    # [新增] 定义训练集专用的强增强
+    train_transform = transforms.Compose([
         CropBottom(CROP_HEIGHT),
-        transforms.Resize(RESIZE_SIZE),  # [关键修复] 必须缩放
+        transforms.Resize(RESIZE_SIZE),
+        # === 新增增强开始 ===
+        # 指纹按压通常会有旋转 (+/- 30度)
+        transforms.RandomRotation(degrees=30),
+        # 指纹按压位置会有偏移 (Translate) 和 形变 (Shear)
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), shear=10),
+        # === 新增增强结束 ===
+        transforms.ToTensor(),
+        transforms.Normalize(mean=NORM_MEAN, std=NORM_STD)
+    ])
+
+    # [新增] 测试集保持简单，不做几何变换
+    test_transform = transforms.Compose([
+        CropBottom(CROP_HEIGHT),
+        transforms.Resize(RESIZE_SIZE),
         transforms.ToTensor(),
         transforms.Normalize(mean=NORM_MEAN, std=NORM_STD)
     ])
@@ -31,9 +45,9 @@ def get_dataloaders(root_dir='Dataset5'):
     if not os.path.exists(train_dir):
         print(f"Warning: Train directory {train_dir} not found.")
     
-    # ImageFolder 加载为 RGB (3通道)
-    train_dataset = datasets.ImageFolder(root=train_dir, transform=transform)
-    test_dataset = datasets.ImageFolder(root=test_dir, transform=transform)
+    # 修改：分别使用 train_transform 和 test_transform
+    train_dataset = datasets.ImageFolder(root=train_dir, transform=train_transform)
+    test_dataset = datasets.ImageFolder(root=test_dir, transform=test_transform)
     
     # 建议开启 pin_memory=True 和 num_workers
     train_loader = DataLoader(

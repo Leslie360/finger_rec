@@ -15,7 +15,7 @@ NUM_CLASSES = 5
 # Training Hyperparameters
 LEARNING_RATE = 1e-3
 NUM_EPOCHS = 200
-WARMUP_EPOCHS = 20
+WARMUP_EPOCHS = 10
 
 # Logging & Checkpointing
 LOG_DIR = "logs"

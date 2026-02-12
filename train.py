@@ -6,146 +6,115 @@ import time
 import os
 import logging
 import sys
+import argparse
 import matplotlib
-matplotlib.use('Agg')  # 强制使用非交互式后端，防止在无界面的 Docker/WSL 中报错
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
 
 from config import (
     BATCH_SIZE, AMP_ENABLED, LTP_POLY, LTD_POLY,
-    LEARNING_RATE, NUM_EPOCHS, WARMUP_EPOCHS,
-    LOG_DIR, LOG_FILE, MODEL_SAVE_PATH
+    DEVICE_NOISE_STD, NORM_MEAN, NORM_STD
 )
 from dataset import get_dataloaders
 from model import get_organic_resnet18
 
+def set_seed(seed=42):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def setup_logging():
-    if not os.path.exists(LOG_DIR):
-        os.makedirs(LOG_DIR)
-    log_path = os.path.join(LOG_DIR, LOG_FILE)
-    
-    # 重新配置 Logger，避免重复打印
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    # 清空之前的 handler
-    if logger.hasHandlers():
-        logger.handlers.clear()
-        
-    formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-    
-    # 文件 Handler
-    file_handler = logging.FileHandler(log_path)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    
-    # 控制台 Handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+# ==========================================
+# 训练逻辑 (保持不变)
+# ==========================================
 
-def plot_curves(train_losses, test_losses, train_accs, test_accs):
-    """绘制 Loss 和 Accuracy 曲线并保存"""
-    epochs = range(1, len(train_losses) + 1)
-    
-    plt.figure(figsize=(12, 5))
-    
-    # Loss 子图
-    plt.subplot(1, 2, 1)
-    plt.plot(epochs, train_losses, 'b-', label='Train Loss')
-    plt.plot(epochs, test_losses, 'r-', label='Test Loss')
-    plt.title('Loss Curve')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
-    
-    # Accuracy 子图
-    plt.subplot(1, 2, 2)
-    plt.plot(epochs, train_accs, 'b-', label='Train Acc')
-    plt.plot(epochs, test_accs, 'r-', label='Test Acc')
-    plt.title('Accuracy Curve')
-    plt.xlabel('Epochs')
-    plt.ylabel('Accuracy (%)')
-    plt.legend()
-    plt.grid(True)
-    
-    save_path = os.path.join(LOG_DIR, "loss_acc_curves.png")
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-    logging.info(f"Training curves saved to {save_path}")
+def mixup_data(x, y, alpha=1.0):
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(device)
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 def apply_ltp_ltd_nonlinearity(model):
-    """硬件感知梯度修正"""
     for param in model.parameters():
-        if param.grad is not None and param.requires_grad:
-            if param.ndim < 2: continue
-            
+        if param.grad is not None and param.requires_grad and param.ndim >= 2:
             g_old = param.grad
             w = param.data
+            w_norm = torch.clamp((w + 1) / 2, 0, 1)
             
-            # Normalize w to [0, 1]
-            w_norm = (w + 1) / 2
-            w_norm = torch.clamp(w_norm, 0, 1)
-            
-            # Polyval helper
             def torch_polyval(coeffs, x):
-                return (coeffs[0] * x**3 + coeffs[1] * x**2 + 
-                        coeffs[2] * x + coeffs[3])
+                return coeffs[0] * x**3 + coeffs[1] * x**2 + coeffs[2] * x + coeffs[3]
             
             ltp_coeffs = torch.tensor(LTP_POLY, device=param.device, dtype=param.dtype)
             ltd_coeffs = torch.tensor(LTD_POLY, device=param.device, dtype=param.dtype)
             
-            slope_ltp = torch_polyval(ltp_coeffs, w_norm)
-            slope_ltd = torch_polyval(ltd_coeffs, w_norm)
-            
-            slope = torch.where(g_old < 0, slope_ltp, slope_ltd)
-            
-            # Update: g_new = g_old * 0.7 + (g_old * slope) * 0.3
-            g_new = g_old * 0.7 + (g_old * slope) * 0.3
-            param.grad = g_new
+            slope = torch.where(g_old < 0, torch_polyval(ltp_coeffs, w_norm), torch_polyval(ltd_coeffs, w_norm))
+            param.grad = g_old * 0.7 + (g_old * slope) * 0.3
 
-class WarmupCosineScheduler(torch.optim.lr_scheduler._LRScheduler):
-    def __init__(self, optimizer, warmup_epochs, max_epochs, last_epoch=-1):
-        self.warmup_epochs = warmup_epochs
-        self.max_epochs = max_epochs
-        super().__init__(optimizer, last_epoch)
-        
-    def get_lr(self):
-        if self.last_epoch < self.warmup_epochs:
-            return [base_lr * (self.last_epoch + 1) / self.warmup_epochs for base_lr in self.base_lrs]
-        else:
-            progress = (self.last_epoch - self.warmup_epochs) / (self.max_epochs - self.warmup_epochs)
-            progress = min(max(progress, 0.0), 1.0)
-            cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-            return [base_lr * cosine_decay for base_lr in self.base_lrs]
-
-def train_one_epoch(model, loader, optimizer, criterion, scaler):
-    """训练一个 Epoch，不打印每一步，只返回统计信息"""
+def train_one_epoch(model, loader, optimizer, criterion, scaler, epoch, args, is_calibration=False):
     model.train()
+    
+    if is_calibration and args.enable_calibration:
+        for module in model.modules():
+            if hasattr(module, 'noise_std'):
+                module.noise_std = 0.0
+    
+    if args.enable_dynamic_noise and not is_calibration:
+        if epoch < args.epochs * 0.8:
+            noise_mult = np.random.uniform(0.5, 2.5)
+        else:
+            noise_mult = np.random.uniform(0.5, 1.0)
+        
+        current_noise = DEVICE_NOISE_STD * noise_mult
+        for module in model.modules():
+            if hasattr(module, 'noise_std'):
+                module.noise_std = current_noise
+    elif not is_calibration:
+        for module in model.modules():
+            if hasattr(module, 'noise_std'):
+                module.noise_std = DEVICE_NOISE_STD
+
     running_loss = 0.0
     correct = 0
     total = 0
     
+    use_mixup = args.enable_mixup and (epoch >= args.warmup_epochs) and (not is_calibration)
+    
     for inputs, labels in loader:
         inputs, labels = inputs.to(device), labels.to(device)
-        
         optimizer.zero_grad()
         
+        if use_mixup:
+            inputs, targets_a, targets_b, lam = mixup_data(inputs, labels)
+            
         with torch.amp.autocast('cuda', enabled=AMP_ENABLED, dtype=torch.bfloat16):
             outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            if use_mixup:
+                loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+            else:
+                loss = criterion(outputs, labels)
         
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         
-        apply_ltp_ltd_nonlinearity(model)
-        
+        if not is_calibration:
+            apply_ltp_ltd_nonlinearity(model)
+            
         scaler.step(optimizer)
         scaler.update()
         
-        # Hard Clamp
         with torch.no_grad():
             for param in model.parameters():
                 if param.requires_grad:
@@ -155,13 +124,10 @@ def train_one_epoch(model, loader, optimizer, criterion, scaler):
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
-    
-    avg_loss = running_loss / len(loader)
-    avg_acc = 100. * correct / total
-    return avg_loss, avg_acc
+        
+    return running_loss / len(loader), 100. * correct / total
 
 def evaluate(model, loader, criterion):
-    """评估模型，返回 Loss 和 Acc"""
     model.eval()
     running_loss = 0.0
     correct = 0
@@ -175,73 +141,272 @@ def evaluate(model, loader, criterion):
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
+    return running_loss / len(loader), 100. * correct / total
+
+# ==========================================
+# 数据导出与可视化 (Data Export & Viz)
+# ==========================================
+
+def save_txt_data(filepath, header, data):
+    """通用保存 txt 函数"""
+    try:
+        np.savetxt(filepath, data, header=header, delimiter=',', comments='', fmt='%.6f')
+        logging.info(f"Data saved to {filepath}")
+    except Exception as e:
+        logging.error(f"Failed to save data to {filepath}: {e}")
+
+def plot_and_save_curves(history, log_dir):
+    """绘制并保存训练曲线数据"""
+    epochs_range = range(1, len(history['train_loss']) + 1)
     
-    avg_loss = running_loss / len(loader)
-    avg_acc = 100. * correct / total
-    return avg_loss, avg_acc
+    # 1. 绘图
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs_range, history['train_loss'], label='Train')
+    plt.plot(epochs_range, history['test_loss'], label='Test')
+    plt.title('Loss'); plt.legend(); plt.grid(True)
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs_range, history['train_acc'], label='Train')
+    plt.plot(epochs_range, history['test_acc'], label='Test')
+    plt.title('Acc'); plt.legend(); plt.grid(True)
+    
+    plt.savefig(os.path.join(log_dir, "curves.png"))
+    plt.close()
+    
+    # 2. 保存数据到 txt
+    # 格式: epoch, train_loss, test_loss, train_acc, test_acc
+    data = np.stack([
+        epochs_range, 
+        history['train_loss'], 
+        history['test_loss'], 
+        history['train_acc'], 
+        history['test_acc']
+    ], axis=1)
+    
+    save_txt_data(
+        os.path.join(log_dir, "history_curves.txt"), 
+        "epoch,train_loss,test_loss,train_acc,test_acc", 
+        data
+    )
+
+def plot_and_save_weights(init_weights, final_model, log_dir):
+    """绘制并保存权重数据"""
+    final_weights = []
+    for name, param in final_model.named_parameters():
+        if "conv1.weight" in name:
+            final_weights = param.data.cpu().numpy()
+            break
+    if len(final_weights) == 0: return
+
+    flat_init = init_weights.flatten()
+    flat_final = final_weights.flatten()
+    
+    # 1. 绘图 (直方图 + 热力图)
+    plt.figure(figsize=(14, 10))
+    plt.subplot(2, 2, 1)
+    sns.histplot(flat_init, bins=50, color='gray', kde=True, label='Init', stat='density', alpha=0.5)
+    plt.title("Weight Distribution: Init"); plt.legend()
+    
+    plt.subplot(2, 2, 2)
+    sns.histplot(flat_final, bins=50, color='purple', kde=True, label='Trained', stat='density', alpha=0.5)
+    plt.title("Weight Distribution: Trained"); plt.legend()
+    
+    k_init = np.mean(init_weights[:4], axis=1) 
+    k_final = np.mean(final_weights[:4], axis=1)
+    viz_init = np.hstack([k_init[i] for i in range(4)])
+    viz_final = np.hstack([k_final[i] for i in range(4)])
+    
+    plt.subplot(2, 1, 2)
+    plt.imshow(np.vstack([viz_init, viz_final]), cmap='coolwarm')
+    plt.title("Kernel Heatmap (Top: Init, Bottom: Trained)"); plt.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(log_dir, "weight_contrast.png"))
+    plt.close()
+    
+    # 2. 保存数据到 txt
+    # 为了方便画分布图，直接保存展平后的权重
+    # 注意：数据量可能较大，这里只保存 conv1 的所有权重
+    np.savetxt(os.path.join(log_dir, "weights_init_conv1.txt"), flat_init, fmt='%.6f')
+    np.savetxt(os.path.join(log_dir, "weights_trained_conv1.txt"), flat_final, fmt='%.6f')
+    logging.info(f"Weight data saved to weights_init_conv1.txt and weights_trained_conv1.txt")
+
+def save_confusion_matrix(model, loader, log_dir):
+    """生成并保存混淆矩阵数据"""
+    model.eval()
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            
+    cm = confusion_matrix(all_labels, all_preds)
+    
+    # 保存图片
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    plt.title('Confusion Matrix')
+    plt.savefig(os.path.join(log_dir, "confusion_matrix.png"))
+    plt.close()
+    
+    # 保存数据 txt
+    np.savetxt(os.path.join(log_dir, "confusion_matrix.txt"), cm, fmt='%d')
+    logging.info("Confusion matrix data saved.")
+
+def robust_evaluate(model, loader, noise_mult=1.0, samples=5):
+    """辅助函数：执行鲁棒性测试并返回准确率"""
+    model.eval()
+    current_noise = DEVICE_NOISE_STD * noise_mult
+    for module in model.modules():
+        if hasattr(module, 'noise_std'):
+            module.noise_std = current_noise
+            module.train() 
+            
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs_sum = 0
+            for _ in range(samples):
+                outputs_sum += model(inputs)
+            outputs_avg = outputs_sum / samples
+            _, predicted = outputs_avg.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+    return 100. * correct / total
+
+def run_final_robustness_scan(model, loader, log_dir):
+    """运行最终的鲁棒性扫描并保存数据"""
+    logging.info("\n=== Final Robustness Evaluation ===")
+    
+    # 1. 扫描不同噪声水平 (单次采样)
+    noise_levels = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
+    scan_results = []
+    
+    logging.info("Scanning noise levels (Single Shot)...")
+    for nl in noise_levels:
+        acc = robust_evaluate(model, loader, noise_mult=nl, samples=1)
+        scan_results.append([nl, acc])
+        logging.info(f"Noise x{nl}: {acc:.2f}%")
+        
+    # 保存扫描数据
+    scan_data = np.array(scan_results)
+    save_txt_data(
+        os.path.join(log_dir, "robustness_scan_data.txt"),
+        "noise_multiplier,accuracy_percent",
+        scan_data
+    )
+    
+    # 2. 关键点多次采样测试
+    logging.info("Multi-sampling tests...")
+    ms_results = []
+    
+    # Noise x1.0, Samples 1
+    acc_1_1 = robust_evaluate(model, loader, noise_mult=1.0, samples=1)
+    ms_results.append([1.0, 1, acc_1_1])
+    logging.info(f"Noise x1.0 (1 sample): {acc_1_1:.2f}%")
+    
+    # Noise x1.0, Samples 10
+    acc_1_10 = robust_evaluate(model, loader, noise_mult=1.0, samples=10)
+    ms_results.append([1.0, 10, acc_1_10])
+    logging.info(f"Noise x1.0 (10 samples): {acc_1_10:.2f}%")
+    
+    # Noise x1.5, Samples 10
+    acc_15_10 = robust_evaluate(model, loader, noise_mult=1.5, samples=10)
+    ms_results.append([1.5, 10, acc_15_10])
+    logging.info(f"Noise x1.5 (10 samples): {acc_15_10:.2f}%")
+    
+    # 保存多次采样数据
+    save_txt_data(
+        os.path.join(log_dir, "multisample_data.txt"),
+        "noise_multiplier,samples,accuracy_percent",
+        np.array(ms_results)
+    )
+
+# ==========================================
+# Main
+# ==========================================
 
 def main():
-    setup_logging()
-    logging.info(f"Configuration: LR={LEARNING_RATE}, Epochs={NUM_EPOCHS}, Batch={BATCH_SIZE}, AMP={AMP_ENABLED}")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--exp_name', type=str, default='baseline', help='Experiment name')
+    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--warmup_epochs', type=int, default=5)
+    parser.add_argument('--enable_mixup', action='store_true')
+    parser.add_argument('--enable_calibration', action='store_true')
+    parser.add_argument('--enable_dynamic_noise', action='store_true')
+    args = parser.parse_args()
+
+    log_dir = os.path.join("logs", args.exp_name)
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
     
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(log_dir, "train.log")),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    
+    logging.info(f"=== Experiment: {args.exp_name} ===")
+    logging.info(f"Settings: Mixup={args.enable_mixup}, Calib={args.enable_calibration}, DynNoise={args.enable_dynamic_noise}")
+    
+    set_seed(42)
     train_loader, test_loader = get_dataloaders()
     
-    model = get_organic_resnet18(pretrained=True)
-    model = model.to(device)
+    model = get_organic_resnet18(pretrained=True).to(device)
+    init_weights = model.conv1.weight.data.cpu().numpy().copy()
     
-    try:
-        model = torch.compile(model)
-        logging.info("Model compiled successfully.")
-    except Exception as e:
-        logging.warning(f"Compile failed: {e}")
-        
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3)
     criterion = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler('cuda', enabled=AMP_ENABLED)
-    scheduler = WarmupCosineScheduler(optimizer, WARMUP_EPOCHS, NUM_EPOCHS)
-    
-    # 存储曲线数据
-    history = {
-        'train_loss': [], 'test_loss': [],
-        'train_acc': [], 'test_acc': []
-    }
-    
-    logging.info("Start Training...")
-    
-    for epoch in range(NUM_EPOCHS):
-        start_time = time.time()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    history = {'train_loss': [], 'test_loss': [], 'train_acc': [], 'test_acc': []}
+
+    try:
+        model = torch.compile(model)
+        logging.info("Model compiled.")
+    except:
+        pass
+
+    for epoch in range(args.epochs):
+        start = time.time()
         
-        # 1. 训练
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, scaler)
+        cycle_idx = epoch % 20
+        is_calib = (cycle_idx >= 18) if args.enable_calibration else False
         
-        # 2. 测试
-        test_loss, test_acc = evaluate(model, test_loader, criterion)
-        
-        # 3. 调度器步进
+        t_loss, t_acc = train_one_epoch(model, train_loader, optimizer, criterion, scaler, epoch, args, is_calib)
+        v_loss, v_acc = evaluate(model, test_loader, criterion)
         scheduler.step()
         
-        duration = time.time() - start_time
-        current_lr = optimizer.param_groups[0]['lr']
+        history['train_loss'].append(t_loss)
+        history['test_loss'].append(v_loss)
+        history['train_acc'].append(t_acc)
+        history['test_acc'].append(v_acc)
         
-        # 4. 记录数据
-        history['train_loss'].append(train_loss)
-        history['test_loss'].append(test_loss)
-        history['train_acc'].append(train_acc)
-        history['test_acc'].append(test_acc)
-        
-        # 5. 打印一行清晰的日志
-        logging.info(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Time: {duration:.1f}s | "
-                     f"Train Loss: {train_loss:.4f} Acc: {train_acc:.2f}% | "
-                     f"Test Loss: {test_loss:.4f} Acc: {test_acc:.2f}% | "
-                     f"LR: {current_lr:.6f}")
-        
-    # 保存模型
-    torch.save(model.state_dict(), MODEL_SAVE_PATH)
-    logging.info(f"Training complete. Model saved to {MODEL_SAVE_PATH}")
+        calib_str = "[CALIB]" if is_calib else ""
+        logging.info(f"Ep {epoch+1}/{args.epochs} {calib_str} | T_Loss:{t_loss:.4f} Acc:{t_acc:.2f}% | V_Loss:{v_loss:.4f} Acc:{v_acc:.2f}% | Time:{time.time()-start:.1f}s")
+
+    torch.save(model.state_dict(), os.path.join(log_dir, "model.pth"))
     
-    # 绘制曲线
-    plot_curves(history['train_loss'], history['test_loss'], 
-                history['train_acc'], history['test_acc'])
+    # === 保存所有数据和图表 ===
+    logging.info("Saving plots and raw data...")
+    plot_and_save_curves(history, log_dir)
+    plot_and_save_weights(init_weights, model, log_dir)
+    save_confusion_matrix(model, test_loader, log_dir)
+    run_final_robustness_scan(model, test_loader, log_dir)
+    
+    logging.info("Experiment Finished.")
 
 if __name__ == "__main__":
     main()
