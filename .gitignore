@@ -1,0 +1,12 @@
+__pycache__/
+Dataset/
+Dataset5/
+Result/
+Result_FINAL/
+Result_SD4_FINAL/
+venv/
+logs/
+*.pyc
+*.pth
+*.npy
+*.png
